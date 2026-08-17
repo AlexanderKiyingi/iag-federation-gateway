@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/alvor-technologies/iag-platform-go/corsenv"
+	"github.com/alvor-technologies/iag-platform-go/runtimeenv"
 	"github.com/iag/federation-gateway/internal/models"
 )
 
@@ -132,57 +133,11 @@ func (c Config) StrictRBAC() bool { return c.HardenedRuntime() }
 
 // HardenedRuntime reports whether production safeguards apply.
 //
-// It deliberately does not just return IsProduction(). That required
-// ENVIRONMENT=production, which the Railway runbooks never told anyone to set,
-// so a hosted instance fell back to the "development" default and ran
-// fail-OPEN: auth.RequirePermission grants EVERY permission to a token carrying
-// an empty permissions array. An unset ENVIRONMENT on a deployed instance now
-// hardens instead; only an explicit dev-like value opts out.
-//
-// This cannot prevent boot — the worst case is a 403 for a caller that should
-// never have had access. Boot-time validation stays keyed on ENVIRONMENT alone.
-//
-// Mirrors the implementation shipped across the domain services; the intent is
-// one shared implementation in shared/platform-go once every service is on it.
+// The decision lives in shared/platform-go/runtimeenv so there is one copy of
+// it. It used to be inlined here, and in twelve other services, which is how
+// two of them were missed when the fail-open bug was fixed.
 func (c Config) HardenedRuntime() bool {
-	// An explicit production value always hardens, including on a Config built
-	// by hand in a test rather than through Load.
-	if c.IsProduction() {
-		return true
-	}
-	if environmentExplicitlySet() {
-		return !c.isDevLike()
-	}
-	return deployedRuntime()
-}
-
-// isDevLike reports an environment where fail-open behaviour is a deliberate
-// local convenience rather than an accident.
-func (c Config) isDevLike() bool {
-	switch c.Environment {
-	case "development", "dev", "local", "test":
-		return true
-	}
-	return false
-}
-
-// environmentExplicitlySet distinguishes a deliberately configured environment
-// from the "development" value Load falls back to when nothing is set. Read
-// from the process rather than captured on Config: StrictRBAC is resolved once
-// during startup wiring, and the environment does not change under us.
-func environmentExplicitlySet() bool {
-	return strings.TrimSpace(os.Getenv("ENVIRONMENT")) != "" ||
-		strings.TrimSpace(os.Getenv("APP_ENV")) != ""
-}
-
-// deployedRuntime distinguishes a hosted instance from a laptop: Railway's
-// injected variables, or gin in release mode, which the Dockerfiles set.
-func deployedRuntime() bool {
-	if strings.TrimSpace(os.Getenv("RAILWAY_ENVIRONMENT")) != "" ||
-		strings.TrimSpace(os.Getenv("RAILWAY_PROJECT_ID")) != "" {
-		return true
-	}
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("GIN_MODE")), "release")
+	return runtimeenv.Hardened(c.Environment)
 }
 
 func (c Config) HasWildcardCORS() bool {
