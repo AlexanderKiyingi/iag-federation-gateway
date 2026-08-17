@@ -15,3 +15,20 @@ restartPolicyMaxRetries = 3
 
 # Railway probes the PORT variable (not ADDR). Keep PORT=4021 in service
 # variables or rely on the Dockerfile default so healthchecks reach the API.
+
+# Replica count lives here rather than in the dashboard, so the topology is
+# reviewable and survives someone clicking in a hurry.
+#
+# Held at 1 deliberately. The code is ready for more — background jobs claim
+# their work, realtime reaches every instance, and pools are bounded and
+# pooler-safe — but two of those protections only engage once their
+# infrastructure exists:
+#
+#   REDIS_URL   the gateway's rate-limit budget is per-process without it, so
+#               N replicas serve N times the configured limit; contract
+#               management's workspace pushes stay local to one instance.
+#   PgBouncer   pools are sized per instance, so replicas multiply connections
+#               against the one shared Postgres.
+#
+# Raise this only after both are in place, and raise the gateway with it.
+numReplicas = 1
