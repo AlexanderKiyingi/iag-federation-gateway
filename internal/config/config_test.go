@@ -50,9 +50,9 @@ func TestValidate_requiresDatabaseURL(t *testing.T) {
 
 func TestValidate_productionGuards(t *testing.T) {
 	cases := []struct {
-		name  string
+		name   string
 		mutate func(*Config)
-		want  string
+		want   string
 	}{
 		{"wildcard cors", func(c *Config) { c.CORSOrigin = "*" }, "ALLOWED_ORIGINS"},
 		{"short secret", func(c *Config) { c.ServiceClientSecret = "tooshort" }, "SERVICE_CLIENT_SECRET"},
