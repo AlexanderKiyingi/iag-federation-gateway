@@ -70,20 +70,18 @@ func main() {
 
 	if cfg.AutoMigrate {
 		if err := autoMigrate(context.Background(), pool); err != nil {
-			slog.Error("auto-migrate", "err", err)
+			slog.Error("auto-migrate failed; refusing to serve", "err", err)
 			os.Exit(1)
 		}
 	} else {
 		slog.Info("auto-migrate disabled — assuming schema is current")
 	}
-
 	st := store.New(pool)
 
 	// --- inbound auth ---
-	// A transient JWKS failure must not crash-loop the container. Boot degrades
-	// to the background refresh (requests fail closed until keys load) and the
-	// loop retries hard while the key set is empty.
 	verifier := platformauth.NewVerifier(cfg.JWKSURL, cfg.JWTIssuer, cfg.Audience)
+	// A transient JWKS failure must not crash-loop the container. Degrade to the
+	// background refresh loop and fail requests closed until keys load.
 	bootstrapJWKS(verifier)
 	go jwksRefreshLoop(ctx, verifier)
 
@@ -122,7 +120,7 @@ func main() {
 		slog.Info("federation-gateway listening",
 			"addr", cfg.Addr,
 			"audience", cfg.Audience,
-			"strategy", string(cfg.ConflictStrategy),
+			"conflictStrategy", string(cfg.ConflictStrategy),
 		)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			listenErr <- err
@@ -134,7 +132,7 @@ func main() {
 
 	select {
 	case sig := <-stop:
-		slog.Info("shutdown", "signal", sig.String())
+		slog.Info("shutdown signal received", "signal", sig.String())
 	case err := <-listenErr:
 		slog.Error("listener died", "err", err)
 		os.Exit(1)
@@ -144,6 +142,7 @@ func main() {
 	defer cancelShutdown()
 	_ = srv.Shutdown(shutdownCtx)
 	cancelApp()
+	slog.Info("graceful shutdown complete")
 }
 
 func configureLogger() {
@@ -176,7 +175,7 @@ func autoMigrate(parent context.Context, pool *pgxpool.Pool) error {
 }
 
 // bootstrapJWKS fetches the key set with bounded retries so a cold auth service
-// does not crash the container, then hands over to the background loop.
+// does not crash-loop the container.
 func bootstrapJWKS(v *platformauth.Verifier) {
 	backoff := time.Second
 	const (
@@ -207,8 +206,9 @@ func bootstrapJWKS(v *platformauth.Verifier) {
 	}
 }
 
-// jwksRefreshLoop runs at two speeds: fast while the key set is empty (every
-// request is failing closed, so recovery must be quick) and slow once loaded.
+// jwksRefreshLoop keeps the key set current, retrying hard while it is empty.
+// An empty key set rejects every authenticated request, so the recovery window
+// must be seconds rather than a full rotation interval.
 func jwksRefreshLoop(ctx context.Context, v *platformauth.Verifier) {
 	const (
 		steadyInterval   = 5 * time.Minute
@@ -252,23 +252,25 @@ func registerPermissionsLoop(ctx context.Context, cfg config.Config) {
 	for _, d := range descriptors {
 		perms = append(perms, platformserviceauth.Permission{Name: d.Name, Description: d.Description})
 	}
+
 	backoff := time.Second
 	const maxBackoff = 5 * time.Minute
-	for {
+	for attempt := 1; ; attempt++ {
 		regCtx, c := context.WithTimeout(ctx, 10*time.Second)
 		err := platformserviceauth.RegisterPermissions(regCtx, saClient, cfg.JWTIssuer, "federation-gateway", perms)
 		c()
 		if err == nil {
-			slog.Info("permissions registered", "count", len(perms))
+			slog.Info("permissions registered", "count", len(perms), "attempts", attempt)
 			return
 		}
-		// 401/403 is a credential misconfiguration that retrying cannot fix;
-		// name the variables to check rather than looping quietly forever.
+		// A 401/403 is a configuration fault retrying cannot fix: the client id
+		// is missing from the auth service's SERVICE_CLIENT_SECRETS_JSON, or the
+		// two secrets disagree. Name it rather than burying it in warnings.
 		if isClientAuthFailure(err) {
-			slog.Error("permission registration rejected — check SERVICE_CLIENT_ID/SERVICE_CLIENT_SECRET against the auth service's SERVICE_CLIENT_SECRETS_JSON",
+			slog.Error("permission registration rejected by auth service — check SERVICE_CLIENT_ID/SERVICE_CLIENT_SECRET match the entry in the auth service's SERVICE_CLIENT_SECRETS_JSON",
 				"client_id", cfg.ServiceClientID, "token_url", cfg.AuthTokenURL, "err", err)
 		} else {
-			slog.Warn("permissions register failed", "err", err, "retry_in", backoff)
+			slog.Warn("permission registration failed; retrying", "err", err, "backoff", backoff)
 		}
 		select {
 		case <-ctx.Done():

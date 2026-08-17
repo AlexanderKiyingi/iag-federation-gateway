@@ -4,3 +4,9 @@
 node_modules/
 dist/
 .turbo/
+
+# compiled binary
+/federation-gateway
+/federation-gateway.exe
+go.standalone.mod
+go.standalone.sum

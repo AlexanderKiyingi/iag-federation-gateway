@@ -2,59 +2,74 @@
 
 Central **sync and conflict resolution** for federated IAG deployments.
 
-Edge nodes — depot nodes, POS terminals, field apps — capture and mutate records
-while offline. Two nodes can edit the same record during the same offline
-window, so bringing them back together is not a copy: it is a **merge with an
-explicit conflict policy**. This service is the authority that performs it.
+Edge deployments (depot nodes, POS terminals, field apps) keep working without
+connectivity: they capture and mutate records locally, then push them here when
+the link returns. Because two nodes can edit the same record during the same
+offline window, sync is not a copy — it is a **merge with an explicit conflict
+policy**. That arbitration is what this service exists to do.
 
 Headless Go/Gin JSON API — no bundled UI.
 
 ## How it works
 
 ```
-  node A ──┐                                    ┌──▶ federation_resources  (authoritative state)
-           ├── POST /v1/sync/push ──▶ [ merge ] ─┼──▶ federation_log        (ordered replication log)
-  node B ──┘                              │      └──▶ federation_conflicts  (parked divergences)
-                                          │
-  node A ◀── GET /v1/sync/pull?cursor= ───┘
+ node A (offline edits) ──┐
+                          ├──POST /v1/sync/push──▶ [ arbitrate ] ──▶ federation_resources
+ node B (offline edits) ──┘                              │              (authoritative)
+                                                         │
+                                                         ├──▶ federation_log (cursor)
+                                                         │        │
+                                                         │        └──GET /v1/sync/pull──▶ other nodes
+                                                         │
+                                                         └──▶ federation_conflicts (parked)
 ```
 
-- **Resources** — one authoritative row per `(resourceType, resourceId)` with a
-  `revision` counter. The payload is opaque JSON: the gateway arbitrates
-  convergence, domain services keep ownership of meaning.
-- **Conflict detection** — every pushed change carries the `baseRevision` the
-  node believed it was editing. Matching the current revision is a clean
-  fast-forward; anything else means someone else edited it first.
-- **Replication order** — the log cursor is a database sequence, **not** a
-  timestamp. Edge clocks drift, so ordering is assigned centrally and a node
-  can never miss or reorder changes.
+- **Authoritative state** — one row per federated record, keyed by
+  `(resourceType, resourceId)`, carrying a `revision` that increments on every
+  applied change.
+- **Conflict detection** — every change declares the `baseRevision` the node
+  believed it was editing. Equal to the current revision means a clean
+  fast-forward; anything else means someone got there first.
+- **Replication order** — `federation_log.cursor` is a database sequence, not a
+  timestamp. Edge clocks drift, so ordering is assigned centrally and nodes pull
+  "everything after cursor N".
 - **Idempotency** — each change carries a node-generated `changeId`. A resend
-  after a lost ack returns `duplicate` instead of applying twice.
-- **Events** — emits `federation.change.applied`,
-  `federation.conflict.detected`, `federation.conflict.resolved` and
-  `federation.node.registered` on `iag.operations`, via a transactional outbox
-  so a change and its announcement commit together.
+  after a lost acknowledgement returns `duplicate` instead of applying twice.
+- **Events** — `federation.change.applied`, `federation.conflict.detected`,
+  `federation.conflict.resolved`, `federation.node.registered` on
+  `iag.operations`, written through a transactional outbox so a change and its
+  announcement commit together.
+
+### What it deliberately does not do
+
+It has no idea what a delivery note or a stock count *is*. Payloads are opaque
+JSON; domain services keep ownership of meaning and this service owns only
+convergence. It therefore cannot validate business rules — a node pushing
+nonsense gets it stored faithfully.
+
+It is also not a message broker or an API gateway: nothing routes *through* it
+to another service.
 
 ## Conflict strategies
 
-Set `CONFLICT_STRATEGY`. An unrecognised value **fails the boot** rather than
-silently degrading to a different merge policy.
+`CONFLICT_STRATEGY` selects the automatic policy. An invalid value fails at
+boot rather than silently degrading to a different merge policy.
 
 | Strategy | Behaviour | Use when |
 |---|---|---|
-| `last_write_wins` (default) | The later edit stamp wins; ties keep the server copy | Edits are naturally sequential |
-| `server_wins` | The central record always survives | The centre owns the record |
-| `node_wins` | The node's change always applies | The edge is the system of record (e.g. physical stock counts) |
-| `manual` | Every conflict is parked for a human | Nothing may be guessed |
+| `last_write_wins` *(default)* | Later edit stamp wins; **ties keep the server** so the result does not depend on arrival order | Edits are naturally time-ordered |
+| `server_wins` | Always keep the central record, reject the node's change | The centre owns the record |
+| `node_wins` | Always apply the node's change | The edge is the system of record (e.g. physical stock counts) |
+| `manual` | Park every conflict for a human; nothing is lost and nothing is guessed | Correctness matters more than throughput |
 
-Two refinements worth knowing:
+Two refinements apply regardless of strategy:
 
-- **Ties keep the server copy.** With equal timestamps there is no evidence the
-  node's edit is newer, so preferring the incumbent makes the result
-  deterministic instead of dependent on which request arrived first.
-- **Same-node stragglers are not conflicts.** A node re-pushing against its own
-  already-superseded revision is discarded, not parked — it is not a
-  two-writer divergence and must not generate queue noise for an operator.
+- A node re-pushing against **its own** already-superseded revision is a
+  straggler, not a two-writer conflict — it is discarded without raising a
+  conflict for a human.
+- A change naming a `baseRevision` for a resource the centre has never seen is
+  **not** treated as a fresh insert. That means state diverged, so it goes
+  through conflict handling.
 
 ## API
 
@@ -62,63 +77,71 @@ All `/v1` routes require a Bearer token with `aud=iag.federation-gateway`.
 
 | Method | Path | Permission |
 |---|---|---|
-| GET | `/v1/status` | `federation.view` |
-| POST | `/v1/nodes/register` | `federation.sync` |
-| GET | `/v1/nodes`, `/v1/nodes/:nodeId` | `federation.view` |
-| PATCH | `/v1/nodes/:nodeId/status` | `federation.manage` |
-| POST | `/v1/sync/push` | `federation.sync` |
-| GET | `/v1/sync/pull?cursor=&limit=&nodeId=` | `federation.sync` |
-| POST | `/v1/sync/ack` | `federation.sync` |
-| GET | `/v1/resources/:type/:id` | `federation.view` |
-| GET | `/v1/conflicts?state=pending` | `federation.view` |
-| POST | `/v1/conflicts/:id/resolve` | `federation.resolve` |
+| `GET` | `/v1/status` | `federation.view` |
+| `POST` | `/v1/nodes/register` | `federation.sync` |
+| `GET` | `/v1/nodes`, `/v1/nodes/:nodeId` | `federation.view` |
+| `PATCH` | `/v1/nodes/:nodeId/status` | `federation.manage` |
+| `POST` | `/v1/sync/push` | `federation.sync` |
+| `GET` | `/v1/sync/pull?cursor=&limit=&nodeId=` | `federation.sync` |
+| `POST` | `/v1/sync/ack` | `federation.sync` |
+| `GET` | `/v1/resources/:type/:id` | `federation.view` |
+| `GET` | `/v1/conflicts?state=pending` | `federation.view` |
+| `POST` | `/v1/conflicts/:id/resolve` | `federation.resolve` |
 
 `federation.sync` is deliberately separate from `federation.manage`: an edge
-node's service account must push and pull continuously, but must never be able
+node's service account must push and pull continuously but must never be able
 to suspend a sibling node or rewrite the conflict policy.
 
-`/`, `/health`, `/healthz` and `/ready` are public probes.
+`/`, `/health`, `/healthz` and `/ready` are public probe paths.
 
-### Pushing changes
+### Push
 
-```jsonc
-POST /v1/sync/push
+```json
 {
   "nodeId": "depot-kla-01",
-  "changes": [{
-    "changeId": "9f1c…",        // node-generated uuid; makes the push idempotent
-    "resourceType": "delivery_note",
-    "resourceId": "dn-1024",
-    "op": "upsert",              // or "delete"
-    "baseRevision": 3,           // 0 when the node believes the record is new
-    "updatedAt": "2026-08-16T09:12:00Z",
-    "payload": { }
-  }]
+  "changes": [
+    {
+      "changeId": "3f1c…",
+      "resourceType": "delivery_note",
+      "resourceId": "dn-1",
+      "op": "upsert",
+      "baseRevision": 4,
+      "updatedAt": "2026-08-16T10:00:00Z",
+      "payload": {"qty": 10}
+    }
+  ]
 }
 ```
 
-Each change comes back with one of: `applied`, `duplicate`, `conflict_resolved`,
-`conflict_pending`, `rejected` — plus the resulting `revision` and `cursor`.
-A push is a batch for transport efficiency, **not** an atomic unit: partial
-success is expected, and one parked conflict must not roll back changes that
-merged cleanly.
-
-## Auth
-
-Inbound Bearer+aud, verified locally against JWKS. RBAC codenames
-(`federation.view|sync|resolve|manage`) are registered with iag-authentication
-at boot, so `SERVICE_CLIENT_ID` must appear in that service's
-`SERVICE_CLIENT_SECRETS_JSON` with a matching secret.
+Each change gets its own result: `applied`, `duplicate`, `conflict_resolved`,
+`conflict_pending` or `rejected`. A push is a batch for transport efficiency,
+**not** an atomic unit — one parked conflict must not roll back the changes
+that merged cleanly, so partial success is the normal outcome.
 
 ## Configuration
 
-See [`config/.env.example`](config/.env.example).
+| Variable | Default | Notes |
+|---|---|---|
+| `PORT` / `ADDR` | `:4021` | Railway probes `PORT` |
+| `DATABASE_URL` | — | **Required.** No memory mode: this service is the record of what every node has synced |
+| `JWT_ISSUER`, `JWKS_URL` | `http://localhost:3001` | Point `JWKS_URL` at the private network; `JWT_ISSUER` must stay the public issuer string that auth signs into `iss` |
+| `AUDIENCE` | `iag.federation-gateway` | Must appear in auth's `USER_TOKEN_AUDIENCES` |
+| `SERVICE_CLIENT_ID` / `SERVICE_CLIENT_SECRET` | `iag-federation-gateway` | Must match the entry in auth's `SERVICE_CLIENT_SECRETS_JSON` |
+| `CONFLICT_STRATEGY` | `last_write_wins` | See above |
+| `MAX_PUSH_BATCH` / `MAX_PULL_BATCH` | `200` / `500` | Bounds lock-hold and response size |
+| `AUTO_MIGRATE` | `true` | Must be `false` in production |
+| `EVENT_BUS_ENABLED`, `KAFKA_BROKERS` | off | Events drop silently when disabled |
 
-## Local development
+## Tests
 
 ```sh
-go test ./...
-go run .
+go test ./...                       # merge rules, config, routing
+TEST_DATABASE_URL=postgres://... go test ./internal/store/...   # real schema + queries
 ```
+
+The store tests skip without `TEST_DATABASE_URL`, so CI without Postgres stays
+green. They cover migration idempotency, the push/pull round-trip, `changeId`
+replay, conflict park-then-resolve, transactional outbox writes, suspended-node
+blocking, cursor monotonicity and deletes.
 
 Registry: [`subrepos.json`](../../subrepos.json)

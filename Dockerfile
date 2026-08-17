@@ -18,6 +18,9 @@ FROM base AS build-standalone
 # Standalone (iag-federation-gateway repo root): the meta-repo is private, so
 # Railway cannot clone it at build time. The standalone repo carries a committed
 # snapshot at third_party/platform-go (refreshed via scripts/sync-platform-go.sh).
+# Keep that snapshot current — a package imported here but missing from it fails
+# only in this build, never locally, because the local go.mod replace points at
+# the canonical shared/platform-go tree.
 WORKDIR /src
 COPY third_party/platform-go ${PLATFORM_GO_DEP}
 COPY go.mod go.sum ./
@@ -38,7 +41,8 @@ RUN go mod edit -replace=github.com/alvor-technologies/iag-platform-go=${PLATFOR
     && go mod download
 COPY edge/federation-gateway/ .
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /federation-gateway .
+RUN go mod edit -replace=github.com/alvor-technologies/iag-platform-go=${PLATFORM_GO_DEP} \
+    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /federation-gateway .
 
 FROM alpine:3.21 AS monorepo
 RUN apk add --no-cache ca-certificates tzdata wget

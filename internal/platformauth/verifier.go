@@ -40,8 +40,9 @@ func (v *Verifier) StartRefreshLoop(ctx context.Context, interval time.Duration)
 
 func (v *Verifier) Verify(token string) (*Claims, error) { return v.inner.Verify(token) }
 
-// HasKeys reports whether any signing key is loaded. With an empty key set the
-// service rejects every token, so the refresh loop uses this to retry hard.
+// HasKeys reports whether any signing key is loaded. With an empty key set every
+// token fails closed, so the refresh loop uses this to retry hard rather than
+// waiting out a full rotation interval.
 func (v *Verifier) HasKeys() bool { return v.inner.HasKeys() }
 
 // Inner exposes the underlying shared verifier for platform middleware.
